@@ -1,0 +1,33 @@
+# MEMEBOT backend – Render, SOLO piani gratuiti. DEMO ONLY: nessuna transazione reale.
+databases:
+  - name: memebot-db
+    plan: free
+    region: frankfurt
+    databaseName: memebot
+    user: memebot
+services:
+  - type: web
+    name: memebot-api
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --no-access-log
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: {name: memebot-db, property: connectionString}
+      - key: API_TOKEN
+        generateValue: true
+      - key: RUN_WORKERS
+        value: all
+      - key: DEFAULT_INITIAL_CAPITAL_SOL
+        value: "2.0"
+      - key: KEEPALIVE_ENABLED
+        value: "true"
+      - key: KEEPALIVE_INTERVAL
+        value: "600"
+      - key: MAX_MONITORED_TOKENS
+        value: "300"
+      - key: LOG_JSON
+        value: "false"
