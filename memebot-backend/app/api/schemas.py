@@ -87,6 +87,41 @@ class EngineSettings(Strict):
     low_liquidity_usd: Optional[float] = Field(None, ge=0)
     low_liquidity_fail_rate: Optional[float] = Field(None, ge=0, le=1)
     max_price_age_sec: Optional[int] = Field(None, ge=5, le=3600)
+    anomaly_guard_enabled: Optional[bool] = None
+    max_gain_x_short_hold: Optional[float] = Field(None, ge=0, le=1000)
+    short_hold_sec: Optional[float] = Field(None, ge=0, le=86400)
+    max_price_deviation_x: Optional[float] = Field(None, ge=0, le=1000)
+    price_reference_window_sec: Optional[int] = Field(None, ge=0, le=86400)
+    price_reference_min_points: Optional[int] = Field(None, ge=1, le=50)
+    sell_retry_backoff_sec: Optional[float] = Field(None, ge=0, le=3600)
+    opportunity_exits_enabled: Optional[bool] = None
+    loss_max_hold_minutes: Optional[float] = Field(None, ge=0, le=100000)
+    stagnant_max_hold_minutes: Optional[float] = Field(None, ge=0, le=100000)
+    stagnant_min_gain_pct: Optional[float] = Field(None, ge=-100, le=10000)
+    rotation_enabled: Optional[bool] = None
+    rotation_min_score: Optional[float] = Field(None, ge=0, le=100)
+    rotation_min_hold_minutes: Optional[float] = Field(None, ge=0, le=100000)
+    rotation_max_pnl_pct: Optional[float] = Field(None, ge=-100, le=10000)
+    rotation_for_copy: Optional[bool] = None
+    partial_tp_enabled: Optional[bool] = None
+    partial_tp_trigger_pct: Optional[float] = Field(None, gt=0, le=100000)
+    partial_tp_fraction: Optional[float] = Field(None, gt=0, le=1)
+    partial_tp_replaces_full_tp: Optional[bool] = None
+    runner_trailing_stop_pct: Optional[float] = Field(None, ge=0, le=99)
+    runner_mcap_drop_pct: Optional[float] = Field(None, ge=0, le=99)
+    runner_volume_drop_ratio: Optional[float] = Field(None, ge=0, le=10)
+    runner_volume_exit_min_drawdown_pct: Optional[float] = Field(None, ge=0, le=99)
+    liquidity_drop_exit_pct: Optional[float] = Field(None, ge=0, le=100)
+    illiquid_liquidity_usd: Optional[float] = Field(None, ge=0)
+    unsellable_after_failures: Optional[int] = Field(None, ge=1, le=1000)
+    forced_exit_max_slippage_pct: Optional[float] = Field(None, ge=0, le=99)
+    entry_filters_enabled: Optional[bool] = None
+    entry_min_liquidity_usd: Optional[float] = Field(None, ge=0)
+    entry_max_sell_impact_pct: Optional[float] = Field(None, ge=0, le=100)
+    entry_pool_check_enabled: Optional[bool] = None
+    entry_min_pool_sol: Optional[float] = Field(None, ge=0)
+    blacklist_enabled: Optional[bool] = None
+    dex_blacklist_after_writeoffs: Optional[int] = Field(None, ge=0, le=1000)
 
 
 class CopySettings(Strict):
@@ -96,6 +131,7 @@ class CopySettings(Strict):
     take_profit_pct: Optional[float] = Field(None, ge=0, le=10000)
     trailing_stop_pct: Optional[float] = Field(None, ge=0, le=99)
     max_open_per_wallet: Optional[int] = Field(None, ge=0, le=50)
+    wallet_disable_after_unsellable: Optional[int] = Field(None, ge=0, le=1000)
 
 
 class TokenOut(BaseModel):
@@ -176,6 +212,10 @@ class PositionOut(BaseModel):
     value_sol: Optional[float] = None
     unrealized_pnl_sol: Optional[float] = None
     pnl_pct: Optional[float] = None
+    partial_tp_done: Optional[bool] = None
+    voided: Optional[bool] = None
+    void_reason: Optional[str] = None
+    entry_liquidity_usd: Optional[float] = None
 
 
 class OrderOut(BaseModel):
@@ -238,3 +278,12 @@ class TradeResult(BaseModel):
     fill_price_sol: Optional[float] = None
     qty: Optional[float] = None
     demo_only: bool = True
+
+
+class VoidRequest(Strict):
+    position_ids: list[int] = Field(..., min_length=1, max_length=500)
+    reason: Optional[str] = Field(None, max_length=300)
+
+
+class UnvoidRequest(Strict):
+    position_ids: list[int] = Field(..., min_length=1, max_length=500)

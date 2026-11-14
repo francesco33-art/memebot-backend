@@ -48,17 +48,29 @@ def check_filters(t: Token, cfg: dict[str, Any]) -> tuple[bool, list[str]]:
     return (not fails), fails
 
 
-def find_candidates(s: Session) -> list[Token]:
+def sniper_slots_free(s: Session) -> int:
+    cfg = get_settings_section(s, "sniper")
+    open_count = s.scalar(select(func.count()).select_from(Position).where(Position.status == "open", Position.origin == "sniper")) or 0
+    return int(cfg["max_open_positions"]) - open_count
+
+
+def find_candidates(s: Session, ignore_capacity: bool = False) -> list[Token]:
+    """Token che superano i filtri. Con ignore_capacity=True ritorna candidati anche senza slot/capitale liberi
+    (il worker valuta se liberare spazio chiudendo la posizione peggiore)."""
     cfg = get_settings_section(s, "sniper")
     if not cfg.get("enabled"):
         return []
-    open_count = s.scalar(select(func.count()).select_from(Position).where(Position.status == "open", Position.origin == "sniper")) or 0
-    slots = int(cfg["max_open_positions"]) - open_count
+    slots = sniper_slots_free(s)
     if slots <= 0:
-        return []
+        if not ignore_capacity:
+            return []
+        slots = 1
     acc = get_account(s)
-    if acc.cash_sol < cfg["amount_sol"] * 1.01:
+    if acc.cash_sol < cfg["amount_sol"] * 1.01 and not ignore_capacity:
         return []
+    from .learning import blocked_reason
+
+    use_bl = bool(get_settings_section(s, "engine").get("blacklist_enabled", True))
     traded = set(s.scalars(select(Position.mint).where(Position.origin == "sniper")).all())
     since = utcnow() - timedelta(minutes=cfg["max_token_age_minutes"] + 30)
     rows = s.scalars(
@@ -67,7 +79,7 @@ def find_candidates(s: Session) -> list[Token]:
     ).all()
     out = []
     for t in rows:
-        if t.mint in traded:
+        if t.mint in traded or (use_bl and blocked_reason(s, t.mint, t)):
             continue
         ok, _ = check_filters(t, cfg)
         if ok:

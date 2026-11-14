@@ -67,7 +67,7 @@ def record_trade(s: Session, wallet: str, sw: dict[str, Any]) -> Optional[Wallet
 def leaderboard(s: Session) -> list[dict[str, Any]]:
     out = []
     for w in s.scalars(select(CopyWallet)).all():
-        pos = s.scalars(select(Position).where(Position.copy_wallet == w.address)).all()
+        pos = s.scalars(select(Position).where(Position.copy_wallet == w.address, Position.voided.is_not(True))).all()
         realized = sum(p.realized_pnl_sol for p in pos)
         unreal = 0.0
         for p in pos:
@@ -86,6 +86,7 @@ def leaderboard(s: Session) -> list[dict[str, Any]]:
             "realized_pnl_sol": realized, "unrealized_pnl_sol": unreal, "total_pnl_sol": realized + unreal,
             "roi_pct": ((realized + unreal) / invested * 100) if invested else None,
             "last_checked_at": w.last_checked_at, "last_error": w.last_error,
+            "unsellable_count": w.unsellable_count or 0,
         })
     out.sort(key=lambda r: r["total_pnl_sol"], reverse=True)
     for i, r in enumerate(out, 1):

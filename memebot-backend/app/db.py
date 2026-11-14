@@ -48,6 +48,9 @@ def init_engine(url: Optional[str] = None) -> Engine:
     from . import models  # noqa: F401  registra i modelli
 
     Base.metadata.create_all(eng)
+    from .migrations import ensure_columns
+
+    ensure_columns(eng)
     return eng
 
 

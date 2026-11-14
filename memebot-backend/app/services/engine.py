@@ -19,7 +19,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db import session_scope
-from ..models import Account, EquitySnapshot, Order, Position, Token, utcnow
+from ..models import Account, EquitySnapshot, Order, Position, PriceSnapshot, Token, utcnow
 from . import events
 from .settings_store import get_settings_section
 
@@ -106,6 +106,68 @@ def _sol_usd(s: Session) -> Optional[float]:
     return get_sol_usd(s)
 
 
+# ---------------------------------------------------------------- guardia anti-prezzi anomali
+PRICE_ANOMALY = "price_anomaly"
+
+
+def reference_price(s: Session, mint: str, cfg: dict[str, Any], *, exclude_after: Optional[datetime] = None) -> Optional[float]:
+    """Prezzo di riferimento "validato": mediana degli snapshot recenti del token.
+
+    Ritorna None se i punti disponibili sono troppo pochi per essere affidabili.
+    """
+    window = float(cfg.get("price_reference_window_sec") or 0)
+    min_pts = int(cfg.get("price_reference_min_points") or 3)
+    if window <= 0:
+        return None
+    since = utcnow() - timedelta(seconds=window)
+    stmt = select(PriceSnapshot.price_sol).where(PriceSnapshot.mint == mint, PriceSnapshot.ts >= since,
+                                                 PriceSnapshot.price_sol.is_not(None), PriceSnapshot.price_sol > 0)
+    if exclude_after is not None:
+        stmt = stmt.where(PriceSnapshot.ts < exclude_after)
+    vals = sorted(float(v) for v in s.scalars(stmt.order_by(PriceSnapshot.ts.desc()).limit(50)).all())
+    if len(vals) < max(min_pts, 1):
+        return None
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
+def deviation_x(a: float, b: float) -> float:
+    """Di quante volte a e b differiscono (>= 1)."""
+    if not a or not b or a <= 0 or b <= 0:
+        return float("inf")
+    return max(a / b, b / a)
+
+
+def _guard_on(cfg: dict[str, Any]) -> bool:
+    return bool(cfg.get("anomaly_guard_enabled", True))
+
+
+# ---------------------------------------------------------------- filtri pre-ingresso (appresi dagli errori)
+def entry_block_reason(s: Session, cfg: dict[str, Any], mint: str, tok: Optional[Token], amount_sol: float) -> Optional[str]:
+    if cfg.get("blacklist_enabled", True):
+        from .learning import blocked_reason
+
+        why = blocked_reason(s, mint, tok)
+        if why:
+            return why
+    if not cfg.get("entry_filters_enabled", True):
+        return None
+    liq = tok.liquidity_usd if tok else None
+    min_liq = float(cfg.get("entry_min_liquidity_usd") or 0)
+    # bonding curve pump.fun: la curva ricompra sempre (non c'è LP da ritirare), soglia non applicata
+    on_curve = tok is not None and (tok.dex_id or "").lower() == "pumpfun"
+    if liq is not None and liq < min_liq and not on_curve:
+        return f"Liquidità ${liq:,.0f} sotto il minimo ${min_liq:,.0f}: rivendita non sicura"
+    max_imp = float(cfg.get("entry_max_sell_impact_pct") or 0)
+    if liq is not None and liq > 0 and max_imp > 0:
+        sol_usd = _sol_usd(s)
+        if sol_usd:
+            impact_pct = (amount_sol * sol_usd) / liq * 100 * float(cfg["price_impact_factor"])
+            if impact_pct > max_imp:
+                return f"Impatto stimato in vendita {impact_pct:.1f}% oltre il {max_imp:g}%: rivendita non sicura"
+    return None
+
+
 # ---------------------------------------------------------------- core fills (sync, una sessione)
 def fill_buy(
     s: Session,
@@ -151,8 +213,21 @@ def fill_buy(
     age = (utcnow() - price_at).total_seconds() if price_at else 1e9
     if age > float(cfg["max_price_age_sec"]):
         return reject(f"Prezzo non aggiornato (ultimo dato {int(age)}s fa)")
+    if _guard_on(cfg):
+        ref = reference_price(s, mint, cfg)
+        max_dev = float(cfg.get("max_price_deviation_x") or 0)
+        if ref and max_dev > 1 and deviation_x(price, ref) > max_dev:
+            msg = (f"Prezzo anomalo: {price:.3e} SOL contro riferimento {ref:.3e} SOL "
+                   f"(scarto {deviation_x(price, ref):.1f}x oltre {max_dev:g}x), acquisto non simulato")
+            events.emit(s, PRICE_ANOMALY, f"Prezzo anomalo scartato: {sym or mint[:6]}", msg,
+                        {"mint": mint, "side": "buy", "price_sol": price, "reference_price_sol": ref})
+            return reject(msg)
 
     liq = tok.liquidity_usd if tok else None
+    if origin != "manual":
+        why = entry_block_reason(s, cfg, mint, tok, amount_sol)
+        if why:
+            return reject(why)
     slip_bps = compute_slippage_bps(cfg, amount_sol, liq, _sol_usd(s))
     if slip_bps > float(cfg["max_slippage_bps"]):
         return reject(f"Slippage stimato {slip_bps / 100:.1f}% oltre il limite", "failed")
@@ -176,7 +251,9 @@ def fill_buy(
                        status="open", qty=0.0, initial_qty=0.0, cost_sol=0.0, total_cost_sol=0.0,
                        stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct, trailing_stop_pct=trailing_stop_pct,
                        max_hold_minutes=max_hold_minutes, peak_price_sol=price, score_at_entry=tok.score if tok else None,
-                       opened_at=utcnow(), fees_sol=0.0, realized_pnl_sol=0.0, proceeds_sol=0.0, entry_fill_price_sol=fill_price)
+                       opened_at=utcnow(), fees_sol=0.0, realized_pnl_sol=0.0, proceeds_sol=0.0, entry_fill_price_sol=fill_price,
+                       entry_liquidity_usd=liq, entry_mcap_usd=tok.market_cap_usd if tok else None,
+                       peak_mcap_usd=tok.market_cap_usd if tok else None, partial_tp_done=False, voided=False)
         s.add(pos)
         new = True
     else:
@@ -245,6 +322,40 @@ def fill_sell(
     age = (utcnow() - price_at).total_seconds() if price_at else 1e9
     if age > float(cfg["max_price_age_sec"]) and not force:
         return fail(f"Prezzo non aggiornato (ultimo dato {int(age)}s fa)", "rejected")
+    if _guard_on(cfg) and not price_override:
+        label = pos.symbol or pos.mint[:6]
+        # 1) prezzo di uscita molto più alto del riferimento validato: si usa il riferimento (prudenziale)
+        ref = reference_price(s, pos.mint, cfg)
+        max_dev = float(cfg.get("max_price_deviation_x") or 0)
+        if ref and max_dev > 1 and price > ref * max_dev:
+            capped = ref * max_dev
+            events.emit(s, PRICE_ANOMALY, f"Prezzo di uscita anomalo: {label}",
+                        f"Prezzo {price:.3e} SOL oltre {max_dev:g}x il riferimento {ref:.3e} SOL: uso {capped:.3e} SOL",
+                        {"mint": pos.mint, "position_id": pos.id, "side": "sell", "price_sol": price, "reference_price_sol": ref})
+            price = capped
+        # 2) guadagno implausibile in pochissimo tempo: il prezzo d'ingresso era un dato errato.
+        #    La posizione viene ricalcolata al prezzo di mercato attuale (come se il follower avesse
+        #    comprato a quel prezzo): stesso costo in SOL, quantità corretta.
+        max_gain = float(cfg.get("max_gain_x_short_hold") or 0)
+        window = float(cfg.get("short_hold_sec") or 0)
+        entry = pos.avg_entry_price_sol or 0
+        held = (utcnow() - _aware(pos.opened_at)).total_seconds() if pos.opened_at else 1e9
+        if max_gain > 1 and window > 0 and entry > 0 and held < window and price / entry > max_gain:
+            mult = price / entry
+            pos.qty = pos.qty / mult
+            pos.initial_qty = (pos.initial_qty or 0) / mult
+            pos.avg_entry_price_sol = pos.cost_sol / pos.qty if pos.qty else price
+            pos.entry_fill_price_sol = (pos.entry_fill_price_sol or entry) * mult
+            pos.peak_price_sol = price
+            qty = pos.qty * fraction
+            events.emit(s, PRICE_ANOMALY, f"Prezzo d'ingresso anomalo corretto: {label}",
+                        f"Guadagno {mult:.1f}x in {held:.0f}s non realistico (limite {max_gain:g}x in {window:g}s): "
+                        f"posizione ricalcolata al prezzo di mercato {price:.3e} SOL",
+                        {"mint": pos.mint, "position_id": pos.id, "side": "sell", "gain_x": mult, "held_sec": held})
+            if reason in ("take_profit", "trailing_stop", "partial_take_profit", "runner_trailing"):
+                s.flush()
+                return fail("Prezzo d'ingresso anomalo corretto: take profit non più valido", "rejected")
+
     liq = tok.liquidity_usd if tok else None
     gross_sol = qty * price
     slip_bps = compute_slippage_bps(cfg, gross_sol, liq, _sol_usd(s))
@@ -253,7 +364,8 @@ def fill_sell(
             return fail(f"Slippage stimato {slip_bps / 100:.1f}% troppo alto")
         if rng.random() < _fail_probability(cfg, liq):
             return fail("Vendita non eseguita (simulazione: transazione scaduta/fallita)")
-    slip_bps = min(slip_bps * rng.uniform(0.6, 1.0), 9_000)
+    cap_bps = float(cfg.get("forced_exit_max_slippage_pct") or 90) * 100
+    slip_bps = min(slip_bps * rng.uniform(0.6, 1.0), cap_bps)
     fill_price = price * (1 - slip_bps / 10_000)
     gross = qty * fill_price
     platform_fee = gross * cfg["fee_bps"] / 10_000
@@ -292,8 +404,12 @@ def fill_sell(
         events.emit(s, events.TAKE_PROFIT, f"Take profit raggiunto: {label}", f"P&L {pnl:+.4f} SOL ({pnl_pct:+.1f}%)", data)
     elif reason == "stop_loss":
         events.emit(s, events.STOP_LOSS, f"Stop loss raggiunto: {label}", f"P&L {pnl:+.4f} SOL ({pnl_pct:+.1f}%)", data)
-    elif reason == "trailing_stop":
+    elif reason in ("trailing_stop", "runner_trailing"):
         events.emit(s, events.TRAILING_STOP, f"Trailing stop: {label}", f"P&L {pnl:+.4f} SOL ({pnl_pct:+.1f}%)", data)
+    elif reason == "partial_take_profit":
+        pos.partial_tp_done = True
+        events.emit(s, events.TAKE_PROFIT, f"Presa di profitto parziale ({fraction * 100:.0f}%): {label}",
+                    f"Incassati {proceeds:.4f} SOL, P&L {pnl:+.4f} SOL. Il resto continua finché volume/market cap reggono", data)
     if closed:
         events.emit(s, events.TRADE_CLOSED, f"Operazione chiusa: {label}",
                     f"Motivo: {reason} · P&L totale {pos.realized_pnl_sol:+.4f} SOL", data)
@@ -328,35 +444,219 @@ class PaperEngine:
 
 
 # ---------------------------------------------------------------- risk manager
+OPPORTUNITY_REASONS = ("loss_timeout", "stagnant", "rotation")
+
+
+def _held_minutes(pos: Position, now: datetime) -> float:
+    return (now - _aware(pos.opened_at)).total_seconds() / 60 if pos.opened_at else 0.0
+
+
 def evaluate_exits(s: Session) -> list[tuple[int, str]]:
-    """Aggiorna mark-to-market e ritorna (position_id, motivo) da chiudere."""
+    """Aggiorna mark-to-market e ritorna (position_id, motivo) da chiudere/alleggerire.
+
+    Ordine delle regole: stop loss, pool svuotato/liquidità crollata, presa di profitto parziale (2x) e
+    uscite "runner" (trailing / calo market cap / calo volume), take profit fisso, trailing, tempo massimo,
+    costo-opportunità (in perdita troppo a lungo / stagnante).
+    """
+    cfg = get_settings_section(s, "engine")
     out: list[tuple[int, str]] = []
     now = utcnow()
     for pos in s.scalars(select(Position).where(Position.status == "open")).all():
-        price, price_at, _ = token_price(s, pos.mint)
+        price, price_at, tok = token_price(s, pos.mint)
         if not price:
             continue
         if price_at and (pos.last_price_at is None or price_at >= _aware(pos.last_price_at)):
             pos.last_price_sol = price
             pos.last_price_at = price_at
         pos.peak_price_sol = max(pos.peak_price_sol or price, price)
-        entry = pos.avg_entry_price_sol or price
-        chg = (price / entry - 1) * 100
-        if pos.stop_loss_pct is not None and chg <= -abs(pos.stop_loss_pct):
-            out.append((pos.id, "stop_loss"))
-        elif pos.take_profit_pct is not None and chg >= abs(pos.take_profit_pct):
-            out.append((pos.id, "take_profit"))
-        elif (
-            pos.trailing_stop_pct
-            and pos.peak_price_sol
-            and pos.peak_price_sol > entry
-            and price <= pos.peak_price_sol * (1 - pos.trailing_stop_pct / 100)
-        ):
-            out.append((pos.id, "trailing_stop"))
-        elif pos.max_hold_minutes and (now - _aware(pos.opened_at)).total_seconds() / 60 >= pos.max_hold_minutes:
-            out.append((pos.id, "max_hold_time"))
+        mcap = tok.market_cap_usd if tok else None
+        if mcap:
+            pos.peak_mcap_usd = max(pos.peak_mcap_usd or mcap, mcap)
+        r = _exit_reason(pos, price, tok, cfg, now)
+        if r:
+            out.append((pos.id, r))
     s.flush()
     return out
+
+
+def _exit_reason(pos: Position, price: float, tok: Optional[Token], cfg: dict[str, Any], now: datetime) -> Optional[str]:
+    entry = pos.avg_entry_price_sol or price
+    chg = (price / entry - 1) * 100
+    liq = tok.liquidity_usd if tok else None
+    auto = pos.origin != "manual"
+    runner = bool(pos.partial_tp_done)
+    if pos.stop_loss_pct is not None and chg <= -abs(pos.stop_loss_pct) and not runner:
+        return "stop_loss"
+    # pool svuotato o liquidità crollata: il prezzo "ultimo scambio" non è più realizzabile
+    illiquid = float(cfg.get("illiquid_liquidity_usd") or 0)
+    if liq is not None and illiquid > 0 and liq < illiquid:
+        return "illiquid"
+    drop = float(cfg.get("liquidity_drop_exit_pct") or 0)
+    if (drop > 0 and liq is not None and pos.entry_liquidity_usd and pos.entry_liquidity_usd > 0
+            and liq < pos.entry_liquidity_usd * (1 - drop / 100)):
+        return "liquidity_drop"
+    partial_on = bool(cfg.get("partial_tp_enabled", True))
+    if partial_on and not runner and chg >= float(cfg.get("partial_tp_trigger_pct") or 100):
+        return "partial_take_profit"
+    if runner:
+        peak = pos.peak_price_sol or price
+        trail = float(cfg.get("runner_trailing_stop_pct") or 0)
+        if trail > 0 and price <= peak * (1 - trail / 100):
+            return "runner_trailing"
+        mdrop = float(cfg.get("runner_mcap_drop_pct") or 0)
+        mcap = tok.market_cap_usd if tok else None
+        if mdrop > 0 and mcap and pos.peak_mcap_usd and mcap <= pos.peak_mcap_usd * (1 - mdrop / 100):
+            return "mcap_drop"
+        vratio = float(cfg.get("runner_volume_drop_ratio") or 0)
+        min_dd = float(cfg.get("runner_volume_exit_min_drawdown_pct") or 0)
+        if (vratio > 0 and tok is not None and tok.volume_h1 and tok.volume_h1 > 0 and tok.volume_m5 is not None
+                and tok.volume_m5 < vratio * tok.volume_h1 / 12 and price <= peak * (1 - min_dd / 100)):
+            return "volume_drop"
+        if chg <= 0:
+            return "runner_trailing"  # il resto non deve mai tornare in perdita
+    full_tp_active = not (partial_on and cfg.get("partial_tp_replaces_full_tp", True))
+    if not runner and full_tp_active and pos.take_profit_pct is not None and chg >= abs(pos.take_profit_pct):
+        return "take_profit"
+    if (
+        not runner
+        and pos.trailing_stop_pct
+        and pos.peak_price_sol
+        and pos.peak_price_sol > entry
+        and price <= pos.peak_price_sol * (1 - pos.trailing_stop_pct / 100)
+    ):
+        return "trailing_stop"
+    held = _held_minutes(pos, now)
+    if not runner and pos.max_hold_minutes and held >= pos.max_hold_minutes:
+        return "max_hold_time"
+    if auto and not runner and cfg.get("opportunity_exits_enabled", True):
+        lmax = float(cfg.get("loss_max_hold_minutes") or 0)
+        if lmax > 0 and chg < 0 and held >= lmax:
+            return "loss_timeout"
+        smax = float(cfg.get("stagnant_max_hold_minutes") or 0)
+        if smax > 0 and held >= smax and chg < float(cfg.get("stagnant_min_gain_pct") or 0):
+            return "stagnant"
+    return None
+
+
+def exit_fraction(s: Session, position_id: int, reason: str) -> float:
+    """Quota da vendere: 1.0, tranne la presa parziale (>= partial_tp_fraction e abbastanza da recuperare il capitale)."""
+    if reason != "partial_take_profit":
+        return 1.0
+    cfg = get_settings_section(s, "engine")
+    pos = s.get(Position, position_id)
+    base = float(cfg.get("partial_tp_fraction") or 0.5)
+    if pos is None or not pos.qty:
+        return base
+    price, _, _ = token_price(s, pos.mint)
+    value = pos.qty * (price or pos.last_price_sol or 0)
+    if value <= 0:
+        return base
+    # frazione che riporta a casa tutto il costo (con margine 5% per slippage e commissioni)
+    principal = pos.cost_sol * 1.05 / value
+    return max(base, min(1.0, principal))
+
+
+def failed_sells_since_last_fill(s: Session, pos: Position) -> int:
+    last_ok = s.scalar(select(func.max(Order.id)).where(Order.position_id == pos.id, Order.status == "filled"))
+    stmt = select(func.count()).select_from(Order).where(Order.position_id == pos.id, Order.side == "sell",
+                                                          Order.status == "failed")
+    if last_ok:
+        stmt = stmt.where(Order.id > last_ok)
+    return s.scalar(stmt) or 0
+
+
+def unsellable_action(s: Session, pos: Position) -> Optional[str]:
+    """None = riprova normale; "write_off" = pool svuotato, valore realistico 0; "force" = uscita forzata."""
+    cfg = get_settings_section(s, "engine")
+    n = int(cfg.get("unsellable_after_failures") or 0)
+    if n <= 0 or failed_sells_since_last_fill(s, pos) < n:
+        return None
+    tok = s.get(Token, pos.mint)
+    liq = tok.liquidity_usd if tok else None
+    illiquid = float(cfg.get("illiquid_liquidity_usd") or 0)
+    if liq is not None and liq < max(illiquid, 1.0):
+        return "write_off"
+    return "force"
+
+
+def write_off_position(s: Session, position_id: int, why: str) -> FillResult:
+    """Chiude una posizione invendibile al valore realisticamente recuperabile (0 SOL): pool svuotato.
+
+    Nessun SOL rientra in cassa: la perdita diventa realizzata e il saldo smette di mostrare un valore
+    che non si potrebbe mai incassare. Poi il bot "impara" (lista nera, penalità wallet).
+    """
+    pos = s.get(Position, position_id)
+    if pos is None or pos.status != "open":
+        raise TradeError("Posizione non trovata o già chiusa")
+    price, price_at, tok = token_price(s, pos.mint)
+    cost = pos.cost_sol
+    pos.realized_pnl_sol += -cost
+    pos.qty = 0.0
+    pos.cost_sol = 0.0
+    pos.status = "closed"
+    pos.closed_at = utcnow()
+    pos.exit_price_sol = 0.0
+    pos.close_reason = "rug_illiquido"
+    s.flush()
+    o = Order(position_id=pos.id, mint=pos.mint, symbol=pos.symbol, side="sell", origin=pos.origin, reason="rug_illiquido",
+              status="filled", fail_reason=why[:1000], qty=0.0, market_price_sol=price, fill_price_sol=0.0, slippage_pct=100.0,
+              fee_sol=0.0, latency_ms=0, sol_amount=0.0, price_ts=price_at)
+    s.add(o)
+    s.flush()
+    label = pos.symbol or pos.mint[:6]
+    events.emit(s, events.TRADE_CLOSED, f"Posizione invendibile chiusa a 0: {label}",
+                f"{why} · perdita {-cost:.4f} SOL (valore recuperabile realistico: 0)",
+                {"mint": pos.mint, "position_id": pos.id, "order_id": o.id, "pnl_sol": -cost, "reason": "rug_illiquido"})
+    from .learning import on_unsellable
+
+    on_unsellable(s, pos, tok, why, get_settings_section(s, "engine"), get_settings_section(s, "copy"))
+    return FillResult(True, o.id, pos.id, "Posizione invendibile chiusa a valore 0", 0.0, 0.0)
+
+
+def unsellable_explanation(s: Session, pos: Position) -> str:
+    tok = s.get(Token, pos.mint)
+    liq = tok.liquidity_usd if tok else None
+    last = s.scalar(select(Order.fail_reason).where(Order.position_id == pos.id, Order.side == "sell", Order.status == "failed")
+                    .order_by(Order.id.desc()).limit(1))
+    parts = []
+    if liq is not None:
+        parts.append(f"liquidità pool ${liq:,.2f}" + (f" (all'ingresso ${pos.entry_liquidity_usd:,.0f})" if pos.entry_liquidity_usd else ""))
+    if tok is not None and tok.dex_id:
+        parts.append(f"dex {tok.dex_id}")
+    if last:
+        parts.append(f"ultimo errore: {last}")
+    n = failed_sells_since_last_fill(s, pos)
+    parts.append(f"{n} vendite simulate fallite")
+    return "Pool svuotato / liquidità rimossa, nessuna via di vendita: " + ", ".join(parts)
+
+
+def pick_rotation_victim(s: Session, *, origin: Optional[str] = None, exclude: Optional[set[int]] = None) -> Optional[Position]:
+    """La posizione peggiore da liberare per un nuovo segnale (mai manuali, mai in profitto oltre la soglia)."""
+    cfg = get_settings_section(s, "engine")
+    now = utcnow()
+    min_hold = float(cfg.get("rotation_min_hold_minutes") or 0)
+    max_pnl = float(cfg.get("rotation_max_pnl_pct") or 0)
+    illiquid = float(cfg.get("illiquid_liquidity_usd") or 0)
+    stmt = select(Position).where(Position.status == "open", Position.origin != "manual")
+    if origin:
+        stmt = stmt.where(Position.origin == origin)
+    best: Optional[tuple[float, Position]] = None
+    for p in s.scalars(stmt).all():
+        if exclude and p.id in exclude:
+            continue
+        if p.partial_tp_done or _held_minutes(p, now) < min_hold:
+            continue
+        price, _, tok = token_price(s, p.mint)
+        if not price or not p.avg_entry_price_sol:
+            continue
+        if tok is not None and tok.liquidity_usd is not None and tok.liquidity_usd < illiquid:
+            continue  # invendibile: se ne occupa il risk manager (chiusura a 0)
+        pnl_pct = (price / p.avg_entry_price_sol - 1) * 100
+        if pnl_pct > max_pnl:
+            continue
+        if best is None or pnl_pct < best[0]:
+            best = (pnl_pct, p)
+    return best[1] if best else None
 
 
 # ---------------------------------------------------------------- portfolio
@@ -387,8 +687,11 @@ def portfolio(s: Session) -> dict[str, Any]:
         if snap is None:
             snap = s.scalar(select(EquitySnapshot).order_by(EquitySnapshot.ts.asc()).limit(1))
         day_start_equity = snap.equity_sol if snap else acc.initial_capital_sol
-    realized = s.scalar(select(func.coalesce(func.sum(Position.realized_pnl_sol), 0.0))) or 0.0
-    closed_count = s.scalar(select(func.count()).select_from(Position).where(Position.status == "closed")) or 0
+    not_void = Position.voided.is_not(True)
+    realized = s.scalar(select(func.coalesce(func.sum(Position.realized_pnl_sol), 0.0)).where(not_void)) or 0.0
+    closed_count = s.scalar(select(func.count()).select_from(Position).where(Position.status == "closed", not_void)) or 0
+    voided_count = s.scalar(select(func.count()).select_from(Position).where(Position.voided.is_(True))) or 0
+    voided_pnl = s.scalar(select(func.coalesce(func.sum(Position.realized_pnl_sol), 0.0)).where(Position.voided.is_(True))) or 0.0
     return {
         "demo_only": True,
         "currency": "SOL virtuali",
@@ -404,6 +707,8 @@ def portfolio(s: Session) -> dict[str, Any]:
         "fees_paid_sol": acc.fees_paid_sol,
         "open_positions": len(open_pos),
         "closed_positions": closed_count,
+        "voided_positions": voided_count,  # operazioni annullate (dati di prezzo errati), escluse dal saldo
+        "voided_pnl_sol": voided_pnl,
         "oldest_open_price_at": oldest_price_at,
         "reset_at": reset_at,
     }

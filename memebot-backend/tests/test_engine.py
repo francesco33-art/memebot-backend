@@ -86,6 +86,7 @@ async def test_stop_loss_triggers(paper):
 async def test_take_profit_triggers(paper):
     with session_scope() as s:
         make_token(s)
+        update_settings_section(s, "engine", {"partial_tp_enabled": False})  # modalità classica: TP fisso al 100%
     r = await paper.buy(MINT, 0.5, stop_loss_pct=20, take_profit_pct=50)
     set_price(MINT, 0.0000016)  # +60%
     w = await _worker(paper)
@@ -100,6 +101,7 @@ async def test_take_profit_triggers(paper):
 async def test_trailing_stop_triggers(paper):
     with session_scope() as s:
         make_token(s)
+        update_settings_section(s, "engine", {"partial_tp_enabled": False})
     r = await paper.buy(MINT, 0.5, stop_loss_pct=50, take_profit_pct=500, trailing_stop_pct=20)
     w = await _worker(paper)
     set_price(MINT, 0.000003)  # picco x3

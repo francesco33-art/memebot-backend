@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..db import get_session
-from ..models import CopyWallet, Device, EquitySnapshot, Event, Order, Position, PriceSnapshot, ServiceStatus, Token, WalletTrade, utcnow
+from ..models import Blacklist, CopyWallet, Device, EquitySnapshot, Event, Order, Position, PriceSnapshot, ServiceStatus, Token, WalletTrade, utcnow
 from ..services import engine as eng
 from ..services.copytrading import leaderboard, validate_public_address
 from ..services.push import apns_configured
@@ -109,7 +109,7 @@ def build_dashboard(s: Session) -> dict[str, Any]:
     since = utcnow() - timedelta(hours=cfg.token_monitor_hours)
     monitored = s.scalar(select(func.count()).select_from(Token).where(Token.discovered_at >= since)) or 0
     new_1h = s.scalar(select(func.count()).select_from(Token).where(Token.discovered_at >= utcnow() - timedelta(hours=1))) or 0
-    closed = s.scalars(select(Position).where(Position.status == "closed")).all()
+    closed = s.scalars(select(Position).where(Position.status == "closed", Position.voided.is_not(True))).all()
     best = sorted(closed, key=lambda p: p.realized_pnl_sol, reverse=True)[:5]
     worst = sorted(closed, key=lambda p: p.realized_pnl_sol)[:5]
     st = services_status(s)
@@ -262,7 +262,7 @@ def history(limit: int = Query(200, le=1000), s: Session = Depends(get_session))
 
 @router.get("/analytics", tags=["analytics"])
 def analytics(s: Session = Depends(get_session)) -> dict[str, Any]:
-    closed = s.scalars(select(Position).where(Position.status == "closed")).all()
+    closed = s.scalars(select(Position).where(Position.status == "closed", Position.voided.is_not(True))).all()
     wins = [p for p in closed if p.realized_pnl_sol > 0]
     losses = [p for p in closed if p.realized_pnl_sol <= 0]
     gross_win = sum(p.realized_pnl_sol for p in wins)
@@ -414,3 +414,67 @@ def register_device(body: sc.DeviceRegister, s: Session = Depends(get_session)) 
     if s.get(Device, body.token) is None:
         s.add(Device(token=body.token, platform=body.platform))
     return {"registered": True, "apns_configured": apns_configured()}
+
+
+# ------------------------------------------------------------------ manutenzione: correzione saldo / invendibili / lista nera
+@router.get("/maintenance/anomalies", tags=["manutenzione"])
+def anomalies(max_gain_x: Optional[float] = Query(None, gt=1), window_sec: Optional[float] = Query(None, gt=0),
+              s: Session = Depends(get_session)) -> dict[str, Any]:
+    """Anteprima (non modifica nulla): operazioni chiuse con guadagni non realistici e saldo corretto stimato."""
+    from ..services.maintenance import find_anomalous_trades
+
+    found = find_anomalous_trades(s, max_gain_x, window_sec)
+    pf = eng.portfolio(s)
+    removed = sum(r["realized_pnl_sol"] for r in found)
+    return {"demo_only": True, "anomalies": found, "total_pnl_sol": removed, "equity_sol": pf["equity_sol"],
+            "equity_after_correction_sol": pf["equity_sol"] - removed}
+
+
+@router.post("/maintenance/void", tags=["manutenzione"])
+def void(body: sc.VoidRequest, s: Session = Depends(get_session)) -> dict[str, Any]:
+    """Annulla (senza cancellare) operazioni chiuse con dati errati: il loro P&L viene stornato dal saldo."""
+    from ..services.maintenance import void_positions
+
+    return void_positions(s, body.position_ids, body.reason or "Annullata manualmente: dato di prezzo non realistico")
+
+
+@router.post("/maintenance/unvoid", tags=["manutenzione"])
+def unvoid(body: sc.UnvoidRequest, s: Session = Depends(get_session)) -> dict[str, Any]:
+    from ..services.maintenance import unvoid_positions
+
+    return unvoid_positions(s, body.position_ids)
+
+
+@router.get("/maintenance/unsellable", tags=["manutenzione"])
+def unsellable(s: Session = Depends(get_session)) -> list[dict[str, Any]]:
+    """Posizioni aperte con vendite simulate fallite e posizioni chiuse come invendibili, con la spiegazione."""
+    out = []
+    for p in s.scalars(select(Position).where(Position.status == "open")).all():
+        n = eng.failed_sells_since_last_fill(s, p)
+        if n:
+            d = position_out(s, p)
+            d["failed_sells"] = n
+            d["explanation"] = eng.unsellable_explanation(s, p)
+            d["next_action"] = eng.unsellable_action(s, p) or "retry"
+            out.append(d)
+    for p in s.scalars(select(Position).where(Position.close_reason == "rug_illiquido")).all():
+        d = position_out(s, p)
+        d["explanation"] = s.scalar(select(Order.fail_reason).where(Order.position_id == p.id, Order.reason == "rug_illiquido")
+                                    .order_by(Order.id.desc()).limit(1))
+        out.append(d)
+    return out
+
+
+@router.get("/blacklist", tags=["manutenzione"])
+def blacklist(s: Session = Depends(get_session)) -> list[dict[str, Any]]:
+    return [{"id": b.id, "kind": b.kind, "value": b.value, "reason": b.reason, "hits": b.hits, "created_at": _aware(b.created_at)}
+            for b in s.scalars(select(Blacklist).order_by(Blacklist.id.desc())).all()]
+
+
+@router.delete("/blacklist/{item_id}", tags=["manutenzione"])
+def blacklist_delete(item_id: int, s: Session = Depends(get_session)) -> dict[str, Any]:
+    b = s.get(Blacklist, item_id)
+    if b is None:
+        raise HTTPException(404, "Voce non trovata")
+    s.delete(b)
+    return {"deleted": item_id}

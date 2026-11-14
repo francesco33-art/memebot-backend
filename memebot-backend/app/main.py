@@ -29,6 +29,15 @@ async def lifespan(app: FastAPI):  # noqa: ANN201
 
     with session_scope() as db:
         get_account(db)
+    try:
+        from .services.maintenance import run_startup_corrections
+
+        with session_scope() as db:
+            res = run_startup_corrections(db)
+        if res:
+            logger.info("correzione saldo all'avvio: %s", res)
+    except Exception:  # noqa: BLE001
+        logger.exception("correzione saldo all'avvio fallita")
     tasks = []
     if s.run_workers:
         from .worker import service_coros

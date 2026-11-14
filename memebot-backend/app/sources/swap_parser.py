@@ -13,6 +13,10 @@ from .common import QUOTE_MINTS, SOL_MINT
 
 MIN_TOKEN_DELTA = 1e-9
 MIN_SOL_DELTA = 0.0005  # sotto questa soglia la variazione è solo fee di rete
+# Se nello stesso swap si muovono sia SOL sia una stablecoin, la gamba SOL è spesso solo rent/fee
+# (es. pool pump.fun quotati in USDC). La stablecoin vince se vale più della gamba SOL anche
+# assumendo un prezzo SOL molto alto (prudenziale).
+SOL_USD_CEILING = 1000.0
 
 
 def _owner_deltas(meta: dict[str, Any], owner: str) -> dict[str, float]:
@@ -77,11 +81,15 @@ def parse_swaps(tx: dict[str, Any], wallet: str) -> list[dict[str, Any]]:
     for mint, d in token_changes.items():
         side = "buy" if d > 0 else "sell"
         quote_asset, quote_amount = None, None
-        for qa in ("SOL", "USDC", "USDT"):
-            qd = quote_deltas.get(qa)
-            if qd is not None and ((side == "buy" and qd < 0) or (side == "sell" and qd > 0)):
-                quote_asset, quote_amount = qa, abs(qd)
-                break
+        cands = [(qa, abs(qd)) for qa in ("SOL", "USDC", "USDT")
+                 if (qd := quote_deltas.get(qa)) is not None and ((side == "buy" and qd < 0) or (side == "sell" and qd > 0))]
+        if cands:
+            quote_asset, quote_amount = cands[0]
+            stables = [c for c in cands if c[0] != "SOL"]
+            if quote_asset == "SOL" and stables:
+                st = max(stables, key=lambda c: c[1])
+                if st[1] > quote_amount * SOL_USD_CEILING:
+                    quote_asset, quote_amount = st
         if quote_asset is None:
             continue  # trasferimento/airdrop, non uno swap
         out.append(

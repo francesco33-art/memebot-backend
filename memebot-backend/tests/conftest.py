@@ -34,7 +34,8 @@ def database(db_url, monkeypatch):
 
     with dbmod.session_scope() as s:
         # test deterministici: nessun fallimento casuale salvo dove richiesto
-        update_settings_section(s, "engine", {"fail_rate": 0.0, "low_liquidity_fail_rate": 0.0})
+        # nessuna chiamata di rete nei test: la verifica pool (Dexscreener) è testata con un finto client
+        update_settings_section(s, "engine", {"fail_rate": 0.0, "low_liquidity_fail_rate": 0.0, "entry_pool_check_enabled": False})
     yield eng
     dbmod.dispose_engine()
     get_settings.cache_clear()

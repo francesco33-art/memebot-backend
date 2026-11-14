@@ -126,6 +126,13 @@ class Position(Base):
     score_at_entry: Mapped[Optional[int]] = mapped_column(Integer)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    # gestione uscite / correzioni (colonne aggiunte con migrazione automatica, vedi migrations.py)
+    entry_liquidity_usd: Mapped[Optional[float]] = mapped_column(Float)
+    entry_mcap_usd: Mapped[Optional[float]] = mapped_column(Float)
+    peak_mcap_usd: Mapped[Optional[float]] = mapped_column(Float)
+    partial_tp_done: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
+    voided: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)  # escluso dal saldo (dato errato)
+    void_reason: Mapped[Optional[str]] = mapped_column(Text)
 
 
 class Order(Base):
@@ -170,6 +177,7 @@ class CopyWallet(Base):
     last_signature: Mapped[Optional[str]] = mapped_column(String(128))
     last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[Optional[str]] = mapped_column(Text)
+    unsellable_count: Mapped[Optional[int]] = mapped_column(Integer, default=0)  # copie finite invendibili
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -227,3 +235,15 @@ class Device(Base):
     token: Mapped[str] = mapped_column(String(200), primary_key=True)  # device token APNs (non è un segreto wallet)
     platform: Mapped[str] = mapped_column(String(16), default="ios")
     registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Blacklist(Base):
+    """Lista nera appresa: token/creator/dex/wallet che hanno prodotto posizioni invendibili."""
+
+    __tablename__ = "blacklist"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(16), index=True)  # mint | creator | dex | wallet
+    value: Mapped[str] = mapped_column(String(64), index=True)
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+    hits: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
