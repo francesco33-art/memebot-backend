@@ -114,3 +114,21 @@ def run_startup_corrections(s: Session) -> Optional[dict[str, Any]]:
         row.value = state
     s.flush()
     return res
+
+
+def run_startup_learning_fixes(s: Session) -> dict[str, Any]:
+    """A ogni avvio (idempotente): profilo sniper v2 una sola volta + lista nera dei dex ricontrollata a tasso."""
+    from .learning import reconcile_dex_blacklist
+    from .settings_store import apply_settings_profiles
+
+    out: dict[str, Any] = {}
+    prof = apply_settings_profiles(s)
+    if prof:
+        out["sniper_profile"] = prof
+        events.emit(s, "settings_profile", "Sniper più selettivo attivato",
+                    "Punteggio minimo 65, liquidità minima 20.000$, token con meno di 20 minuti, solo PumpSwap con "
+                    "liquidità bloccata, massimo 6 operazioni all'ora, 0,05 SOL per operazione", prof)
+    changed = reconcile_dex_blacklist(s, get_settings_section(s, "engine"))
+    if changed:
+        out["dex_blacklist"] = changed
+    return out

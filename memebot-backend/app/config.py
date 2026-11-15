@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     # Intervalli scanner (secondi)
     dexscreener_discovery_interval: int = 30
     enrich_interval: int = 10
+    # prezzi delle sole posizioni aperte (1 richiesta Dexscreener /tokens ogni 3 s per max 30 token = 20 req/min,
+    # ben sotto il limite pubblico di 300 req/min; il client applica comunque un limite di 240/min sull'host)
+    open_price_interval: float = 3.0
     geckoterminal_interval: int = 45
     sol_price_interval: int = 30
     rugcheck_interval: float = 4.0

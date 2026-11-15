@@ -72,6 +72,27 @@ class SniperSettings(Strict):
     trailing_stop_pct: Optional[float] = Field(None, ge=0, le=99)
     max_hold_minutes: Optional[float] = Field(None, ge=0)
     require_holder_data: Optional[bool] = None
+    min_token_age_minutes: Optional[float] = Field(None, ge=0)
+    max_top1_pct: Optional[float] = Field(None, ge=0, le=100)
+    allowed_dexes: Optional[list[str]] = None
+    require_lp_locked: Optional[bool] = None
+    min_lp_locked_pct: Optional[float] = Field(None, ge=0, le=100)
+    lp_lock_scope: Optional[str] = Field(None, pattern="^(all|main)$")
+    require_no_mint_authority: Optional[bool] = None
+    require_no_freeze_authority: Optional[bool] = None
+    min_pool_sol: Optional[float] = Field(None, ge=0)
+    max_mcap_liquidity_ratio: Optional[float] = Field(None, ge=0, le=1000)
+    max_trades_per_hour: Optional[int] = Field(None, ge=0, le=1000)
+    min_seconds_between_trades: Optional[float] = Field(None, ge=0, le=86400)
+    pause_after_consecutive_losses: Optional[int] = Field(None, ge=0, le=100)
+    pause_minutes: Optional[float] = Field(None, ge=0, le=10080)
+    learning_enabled: Optional[bool] = None
+    rug_loss_pct: Optional[float] = Field(None, gt=0, le=100)
+    learn_score_step: Optional[int] = Field(None, ge=0, le=50)
+    learn_liquidity_step_usd: Optional[float] = Field(None, ge=0)
+    learn_max_score_boost: Optional[int] = Field(None, ge=0, le=100)
+    learn_max_liquidity_boost_usd: Optional[float] = Field(None, ge=0)
+    learn_relax_after_wins: Optional[int] = Field(None, ge=0, le=100)
 
 
 class EngineSettings(Strict):
@@ -108,6 +129,14 @@ class EngineSettings(Strict):
     partial_tp_fraction: Optional[float] = Field(None, gt=0, le=1)
     partial_tp_replaces_full_tp: Optional[bool] = None
     runner_trailing_stop_pct: Optional[float] = Field(None, ge=0, le=99)
+    tp_ladder_enabled: Optional[bool] = None
+    tp_ladder_step_pct: Optional[float] = Field(None, ge=10, le=100000)
+    tp_ladder_sell_fraction: Optional[float] = Field(None, gt=0, le=1)
+    min_remaining_value_sol: Optional[float] = Field(None, ge=0, le=100)
+    runner_trailing_tier1_x: Optional[float] = Field(None, ge=1, le=100000)
+    runner_trailing_tier1_pct: Optional[float] = Field(None, ge=0, le=99)
+    runner_trailing_tier2_x: Optional[float] = Field(None, ge=1, le=100000)
+    runner_trailing_tier2_pct: Optional[float] = Field(None, ge=0, le=99)
     runner_mcap_drop_pct: Optional[float] = Field(None, ge=0, le=99)
     runner_volume_drop_ratio: Optional[float] = Field(None, ge=0, le=10)
     runner_volume_exit_min_drawdown_pct: Optional[float] = Field(None, ge=0, le=99)
@@ -122,6 +151,7 @@ class EngineSettings(Strict):
     entry_min_pool_sol: Optional[float] = Field(None, ge=0)
     blacklist_enabled: Optional[bool] = None
     dex_blacklist_after_writeoffs: Optional[int] = Field(None, ge=0, le=1000)
+    dex_blacklist_min_rate: Optional[float] = Field(None, ge=0, le=1)
 
 
 class CopySettings(Strict):
@@ -173,6 +203,8 @@ class TokenOut(BaseModel):
     mint_authority: Optional[bool] = None
     freeze_authority: Optional[bool] = None
     rugged: Optional[bool] = None
+    lp_locked_pct: Optional[float] = None
+    lp_locked_main_pct: Optional[float] = None
     fomo_buys: Optional[int] = None
     fomo_sells: Optional[int] = None
     score: Optional[int] = None
@@ -213,6 +245,7 @@ class PositionOut(BaseModel):
     unrealized_pnl_sol: Optional[float] = None
     pnl_pct: Optional[float] = None
     partial_tp_done: Optional[bool] = None
+    tp_steps_done: Optional[int] = None
     voided: Optional[bool] = None
     void_reason: Optional[str] = None
     entry_liquidity_usd: Optional[float] = None

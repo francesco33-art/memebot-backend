@@ -58,6 +58,8 @@ class Token(Base):
     freeze_authority: Mapped[Optional[bool]] = mapped_column(Boolean)
     rugged: Mapped[Optional[bool]] = mapped_column(Boolean)
     rug_risks: Mapped[Optional[list]] = mapped_column(JSON)
+    lp_locked_pct: Mapped[Optional[float]] = mapped_column(Float)  # % LP bloccata nel pool peggiore (RugCheck)
+    lp_locked_main_pct: Mapped[Optional[float]] = mapped_column(Float)  # % LP bloccata nel pool principale
     rugcheck_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     fomo_buys: Mapped[int] = mapped_column(Integer, default=0)
     fomo_sells: Mapped[int] = mapped_column(Integer, default=0)
@@ -131,6 +133,7 @@ class Position(Base):
     entry_mcap_usd: Mapped[Optional[float]] = mapped_column(Float)
     peak_mcap_usd: Mapped[Optional[float]] = mapped_column(Float)
     partial_tp_done: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
+    tp_steps_done: Mapped[Optional[int]] = mapped_column(Integer, default=0)  # gradini +100% già incassati
     voided: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)  # escluso dal saldo (dato errato)
     void_reason: Mapped[Optional[str]] = mapped_column(Text)
 

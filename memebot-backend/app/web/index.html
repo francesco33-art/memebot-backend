@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MEMEBOT">
+<meta name="theme-color" content="#07060d">
+<meta name="robots" content="noindex">
+<title>MEMEBOT · DEMO</title>
+<link rel="manifest" href="/app/manifest.json">
+<link rel="apple-touch-icon" href="/app/icon-180.png">
+<link rel="icon" type="image/png" href="/app/icon-192.png">
+<link rel="stylesheet" href="/app/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">MEME<span>BOT</span></div>
+  <div class="demo-badge">DEMO ONLY – nessuna transazione reale</div>
+</header>
+
+<section id="login" class="screen hidden">
+  <div class="card login-card">
+    <h1>Benvenuto</h1>
+    <p>Inserisci il <b>Token di accesso</b> del tuo bot. Resta salvato solo su questo telefono.</p>
+    <input id="token-input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Token di accesso">
+    <button id="token-save" class="btn primary">Entra</button>
+    <p id="login-error" class="error"></p>
+    <p class="muted small">MEMEBOT è solo una simulazione: non usa soldi veri e non chiede mai chiavi private o seed phrase.</p>
+  </div>
+</section>
+
+<main id="main" class="hidden">
+  <section id="tab-dashboard" class="tab">
+    <div class="card hero">
+      <div class="muted small">Patrimonio virtuale</div>
+      <div class="big" id="d-equity">–</div>
+      <div id="d-return" class="pill">–</div>
+      <svg id="chart" viewBox="0 0 300 80" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="grid">
+      <div class="card stat"><div class="muted small">Liquidità</div><div id="d-cash">–</div></div>
+      <div class="card stat"><div class="muted small">Valore posizioni</div><div id="d-open">–</div></div>
+      <div class="card stat"><div class="muted small">P&amp;L realizzato</div><div id="d-real">–</div></div>
+      <div class="card stat"><div class="muted small">P&amp;L non realizzato</div><div id="d-unreal">–</div></div>
+      <div class="card stat"><div class="muted small">Oggi</div><div id="d-daily">–</div></div>
+      <div class="card stat"><div class="muted small">Commissioni simulate</div><div id="d-fees">–</div></div>
+      <div class="card stat"><div class="muted small">Posizioni aperte</div><div id="d-nopen">–</div></div>
+      <div class="card stat"><div class="muted small">Operazioni chiuse</div><div id="d-nclosed">–</div></div>
+    </div>
+    <div class="card">
+      <div class="row"><span>Sniper</span><label class="switch"><input type="checkbox" id="sw-sniper"><span></span></label></div>
+      <div class="row"><span>Copy trading</span><label class="switch"><input type="checkbox" id="sw-copy"><span></span></label></div>
+      <div class="muted small">Accende o spegne gli acquisti simulati. Le posizioni aperte continuano a essere gestite.</div>
+    </div>
+    <div class="card small muted" id="d-status">–</div>
+    <button id="logout" class="btn ghost">Esci / cambia token</button>
+  </section>
+
+  <section id="tab-positions" class="tab hidden">
+    <h2>Posizioni aperte</h2>
+    <div id="positions-list" class="list"></div>
+  </section>
+
+  <section id="tab-history" class="tab hidden">
+    <h2>Storico</h2>
+    <div id="history-list" class="list"></div>
+  </section>
+
+  <section id="tab-events" class="tab hidden">
+    <h2>Eventi live</h2>
+    <div id="events-list" class="list"></div>
+  </section>
+
+  <section id="tab-wallets" class="tab hidden">
+    <h2>Wallet copiati</h2>
+    <div id="wallets-list" class="list"></div>
+  </section>
+</main>
+
+<div id="sheet" class="sheet hidden"><div class="sheet-body card" id="sheet-body"></div></div>
+
+<nav id="tabbar" class="tabbar hidden">
+  <button data-tab="dashboard" class="active"><span class="ico">◈</span>Dashboard</button>
+  <button data-tab="positions"><span class="ico">▤</span>Posizioni</button>
+  <button data-tab="history"><span class="ico">↺</span>Storico</button>
+  <button data-tab="events"><span class="ico">⚡</span>Eventi</button>
+  <button data-tab="wallets"><span class="ico">◎</span>Wallet</button>
+</nav>
+<script src="/app/app.js"></script>
+</body>
+</html>

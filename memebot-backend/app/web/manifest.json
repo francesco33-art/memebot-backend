@@ -1,0 +1,15 @@
+{
+  "name": "MEMEBOT (DEMO)",
+  "short_name": "MEMEBOT",
+  "description": "Dashboard del bot di paper trading MEMEBOT. Solo simulazione: nessuna transazione reale.",
+  "start_url": "/app/",
+  "scope": "/app/",
+  "display": "standalone",
+  "background_color": "#07060d",
+  "theme_color": "#07060d",
+  "lang": "it",
+  "icons": [
+    {"src": "/app/icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "/app/icon-512.png", "sizes": "512x512", "type": "image/png"}
+  ]
+}

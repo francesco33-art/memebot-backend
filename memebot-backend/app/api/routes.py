@@ -18,7 +18,8 @@ from ..services.push import apns_configured
 from ..services.scanner_state import get_sol_usd_full
 from ..services.scoring import DISCLAIMER, score_token
 from ..services.settings_store import get_settings_section, update_settings_section
-from ..services.sniper import check_filters
+from ..sources.common import normalize_dex
+from ..services.sniper import check_filters, sniper_cfg, sniper_gate
 from . import schemas as sc
 
 router = APIRouter(prefix="/api")
@@ -181,7 +182,7 @@ def token_detail(mint: str, s: Session = Depends(get_session)) -> dict[str, Any]
     if t is None:
         raise HTTPException(404, "Token non trovato")
     r = score_token(t)
-    sn = get_settings_section(s, "sniper")
+    sn = sniper_cfg(s)
     ok, fails = check_filters(t, sn)
     d = token_out(t)
     d.update({"score_components": r.components, "flags": r.flags, "partial_data": r.partial_data, "disclaimer": DISCLAIMER,
@@ -324,7 +325,27 @@ def put_sniper(body: sc.SniperSettings, s: Session = Depends(get_session)) -> di
     vals = body.model_dump(exclude_none=True)
     if "allowed_risk" in vals:
         vals["allowed_risk"] = [r.upper() for r in vals["allowed_risk"] if r.upper() in ("LOW", "MEDIUM", "HIGH", "CRITICAL")]
+    if "allowed_dexes" in vals:
+        vals["allowed_dexes"] = [d for d in (normalize_dex(x) for x in vals["allowed_dexes"]) if d]
     return update_settings_section(s, "sniper", vals)
+
+
+@router.get("/sniper/status", tags=["impostazioni"])
+def sniper_status(s: Session = Depends(get_session)) -> dict[str, Any]:
+    """Soglie effettive dello sniper (impostazioni + apprendimento) e motivo di un'eventuale pausa."""
+    from ..services.learning import learned_state
+
+    cfg = sniper_cfg(s)
+    return {"demo_only": True, "enabled": bool(cfg.get("enabled")), "paused_reason": sniper_gate(s, cfg),
+            "effective_min_score": cfg["min_score"], "effective_min_liquidity_usd": cfg["min_liquidity_usd"],
+            "learned": learned_state(s)}
+
+
+@router.post("/sniper/learning/reset", tags=["impostazioni"])
+def sniper_learning_reset(s: Session = Depends(get_session)) -> dict[str, Any]:
+    from ..services.learning import reset_sniper_learning
+
+    return {"demo_only": True, "learned": reset_sniper_learning(s)}
 
 
 @router.put("/settings/engine", tags=["impostazioni"])

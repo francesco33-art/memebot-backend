@@ -19,12 +19,12 @@ from ..sources.dexscreener import Dexscreener
 from ..sources.solana_rpc import SolanaRPC
 from . import events
 from .copytrading import fetch_new_trades, record_trade
-from .engine import (PRICE_ANOMALY, PaperEngine, deviation_x, evaluate_exits, exit_fraction, get_account, pick_rotation_victim,
+from .engine import (PRICE_ANOMALY, PaperEngine, deviation_x, evaluate_exits, exit_plan, get_account, pick_rotation_victim,
                      reference_price, snapshot_equity, unsellable_action, unsellable_explanation, write_off_position)
 from .scanner import upsert_token
 from .scanner_state import get_sol_usd
 from .settings_store import get_settings_section
-from .sniper import find_candidates, sniper_slots_free
+from .sniper import find_candidates, sniper_cfg, sniper_slots_free
 
 logger = logging.getLogger("memebot.engine_worker")
 
@@ -67,9 +67,11 @@ class EngineWorker:
                         done.append((pid, "rug_illiquido"))
                         self._sell_retry_at.pop(pid, None)
                         continue
-                    frac = exit_fraction(s, pid, reason)
+                    frac, step = exit_plan(s, pid, reason)
                 if action == "force":
                     r = await self.engine.sell(pid, 1.0, reason="uscita_forzata", force=True)
+                elif step is not None:
+                    r = await self.engine.sell(pid, frac, reason=reason, tp_step=step)
                 else:
                     r = await self.engine.sell(pid, frac, reason=reason)
                 if r.ok:
@@ -88,7 +90,7 @@ class EngineWorker:
         return done
 
     # ------------------------------------------------------------ verifica via di vendita (dati reali Dexscreener)
-    async def pool_check(self, mint: str) -> Optional[str]:
+    async def pool_check(self, mint: str, min_pool_sol: Optional[float] = None) -> Optional[str]:
         """None se il token è rivendibile, altrimenti il motivo. Usa le riserve reali dei pool (Dexscreener).
 
         Fail-open se la fonte non risponde (lo segnala nel log): il filtro non deve fermare il bot.
@@ -100,10 +102,10 @@ class EngineWorker:
             bonding = tok.bonding_curve_sol if tok else None
         if not cfg.get("entry_filters_enabled", True) or not cfg.get("entry_pool_check_enabled", True):
             return None
-        min_sol = float(cfg.get("entry_min_pool_sol") or 0)
+        min_sol = max(float(cfg.get("entry_min_pool_sol") or 0), float(min_pool_sol or 0))
         if min_sol <= 0:
             return None
-        hit = self._pool_cache.get(mint)
+        hit = self._pool_cache.get(f"{mint}:{min_sol:g}")
         if hit and hit[0] > time.monotonic():
             return hit[1]
         try:
@@ -139,7 +141,7 @@ class EngineWorker:
             why = f"Pool con solo {pool_sol:.2f} SOL (minimo {min_sol:g}): via di vendita insufficiente"
         else:
             why = None
-        self._pool_cache[mint] = (time.monotonic() + 60, why)
+        self._pool_cache[f"{mint}:{min_sol:g}"] = (time.monotonic() + 60, why)
         return why
 
     async def _rotate(self, *, origin: Optional[str], why: str) -> bool:
@@ -170,7 +172,7 @@ class EngineWorker:
 
     async def sniper_step(self) -> list[int]:
         with session_scope() as s:
-            cfg = get_settings_section(s, "sniper")
+            cfg = sniper_cfg(s)
             ecfg = get_settings_section(s, "engine")
             rotate = bool(ecfg.get("rotation_enabled", True))
             cands = [(t.mint, t.symbol, t.score or 0) for t in find_candidates(s, ignore_capacity=rotate)]
@@ -190,7 +192,7 @@ class EngineWorker:
                     continue
                 if not self._has_cash(amount):
                     continue
-            why = await self.pool_check(mint)
+            why = await self.pool_check(mint, float(cfg.get("min_pool_sol") or 0))
             if why:
                 self._snipe_attempts[mint] = 3  # non rivendibile: non riprovare
                 with session_scope() as s:

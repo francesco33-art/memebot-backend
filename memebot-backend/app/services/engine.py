@@ -253,7 +253,8 @@ def fill_buy(
                        max_hold_minutes=max_hold_minutes, peak_price_sol=price, score_at_entry=tok.score if tok else None,
                        opened_at=utcnow(), fees_sol=0.0, realized_pnl_sol=0.0, proceeds_sol=0.0, entry_fill_price_sol=fill_price,
                        entry_liquidity_usd=liq, entry_mcap_usd=tok.market_cap_usd if tok else None,
-                       peak_mcap_usd=tok.market_cap_usd if tok else None, partial_tp_done=False, voided=False)
+                       peak_mcap_usd=tok.market_cap_usd if tok else None, partial_tp_done=False, tp_steps_done=0,
+                       voided=False)
         s.add(pos)
         new = True
     else:
@@ -292,6 +293,7 @@ def fill_sell(
     rng: Optional[random.Random] = None,
     price_override: Optional[tuple[float, datetime]] = None,
     force: bool = False,
+    tp_step: Optional[int] = None,
 ) -> FillResult:
     rng = rng or random.Random()
     cfg = get_settings_section(s, "engine")
@@ -357,6 +359,7 @@ def fill_sell(
                 return fail("Prezzo d'ingresso anomalo corretto: take profit non più valido", "rejected")
 
     liq = tok.liquidity_usd if tok else None
+    pos_entry = pos.avg_entry_price_sol or 0
     gross_sol = qty * price
     slip_bps = compute_slippage_bps(cfg, gross_sol, liq, _sol_usd(s))
     if not force:
@@ -407,13 +410,30 @@ def fill_sell(
     elif reason in ("trailing_stop", "runner_trailing"):
         events.emit(s, events.TRAILING_STOP, f"Trailing stop: {label}", f"P&L {pnl:+.4f} SOL ({pnl_pct:+.1f}%)", data)
     elif reason == "partial_take_profit":
+        prev = steps_done(pos)
         pos.partial_tp_done = True
-        events.emit(s, events.TAKE_PROFIT, f"Presa di profitto parziale ({fraction * 100:.0f}%): {label}",
-                    f"Incassati {proceeds:.4f} SOL, P&L {pnl:+.4f} SOL. Il resto continua finché volume/market cap reggono", data)
+        pos.tp_steps_done = max(prev + 1, int(tp_step or 0))
+        data["tp_step"] = pos.tp_steps_done
+        mult = price / pos_entry if pos_entry else 0
+        rest = "Il resto continua finché prezzo/volume/market cap reggono" if not closed else "Posizione chiusa (resto troppo piccolo)"
+        events.emit(s, events.TAKE_PROFIT, f"Presa di profitto a {mult:.1f}x ({fraction * 100:.0f}% del rimanente): {label}",
+                    f"Gradino {pos.tp_steps_done} · incassati {proceeds:.4f} SOL, P&L {pnl:+.4f} SOL. {rest}", data)
     if closed:
         events.emit(s, events.TRADE_CLOSED, f"Operazione chiusa: {label}",
                     f"Motivo: {reason} · P&L totale {pos.realized_pnl_sol:+.4f} SOL", data)
+        _learn_from_close(s, pos, tok)
     return FillResult(True, o.id, pos.id, "Vendita simulata eseguita", fill_price, qty)
+
+
+def _learn_from_close(s: Session, pos: Position, tok: Optional[Token]) -> None:
+    if pos.origin != "sniper":
+        return
+    try:
+        from .learning import on_sniper_closed
+
+        on_sniper_closed(s, pos, tok, get_settings_section(s, "sniper"))
+    except Exception:  # noqa: BLE001 - l'apprendimento non deve mai bloccare una vendita
+        logging.getLogger("memebot.engine").exception("apprendimento sniper fallito")
 
 
 # ---------------------------------------------------------------- async wrappers con latenza reale
@@ -484,7 +504,8 @@ def _exit_reason(pos: Position, price: float, tok: Optional[Token], cfg: dict[st
     chg = (price / entry - 1) * 100
     liq = tok.liquidity_usd if tok else None
     auto = pos.origin != "manual"
-    runner = bool(pos.partial_tp_done)
+    done = steps_done(pos)
+    runner = done > 0
     if pos.stop_loss_pct is not None and chg <= -abs(pos.stop_loss_pct) and not runner:
         return "stop_loss"
     # pool svuotato o liquidità crollata: il prezzo "ultimo scambio" non è più realizzabile
@@ -495,12 +516,13 @@ def _exit_reason(pos: Position, price: float, tok: Optional[Token], cfg: dict[st
     if (drop > 0 and liq is not None and pos.entry_liquidity_usd and pos.entry_liquidity_usd > 0
             and liq < pos.entry_liquidity_usd * (1 - drop / 100)):
         return "liquidity_drop"
-    partial_on = bool(cfg.get("partial_tp_enabled", True))
-    if partial_on and not runner and chg >= float(cfg.get("partial_tp_trigger_pct") or 100):
+    lad = ladder_cfg(cfg)
+    partial_on = lad is not None
+    if lad is not None and ladder_step_reached(pos, price, cfg) > done:
         return "partial_take_profit"
     if runner:
         peak = pos.peak_price_sol or price
-        trail = float(cfg.get("runner_trailing_stop_pct") or 0)
+        trail = runner_trailing_pct(cfg, peak / entry if entry else 1.0)
         if trail > 0 and price <= peak * (1 - trail / 100):
             return "runner_trailing"
         mdrop = float(cfg.get("runner_mcap_drop_pct") or 0)
@@ -538,22 +560,79 @@ def _exit_reason(pos: Position, price: float, tok: Optional[Token], cfg: dict[st
     return None
 
 
-def exit_fraction(s: Session, position_id: int, reason: str) -> float:
-    """Quota da vendere: 1.0, tranne la presa parziale (>= partial_tp_fraction e abbastanza da recuperare il capitale)."""
+def steps_done(pos: Position) -> int:
+    """Gradini della scala di profitto già incassati (le posizioni della versione precedente con presa parziale = 1)."""
+    return max(int(pos.tp_steps_done or 0), 1 if pos.partial_tp_done else 0)
+
+
+def ladder_cfg(cfg: dict[str, Any]) -> Optional[tuple[float, float, Optional[int]]]:
+    """(gradino %, quota da vendere, numero massimo di gradini) oppure None se le prese parziali sono spente."""
+    if not cfg.get("partial_tp_enabled", True):  # interruttore generale delle prese parziali
+        return None
+    if cfg.get("tp_ladder_enabled", True):
+        return (float(cfg.get("tp_ladder_step_pct") or 100), float(cfg.get("tp_ladder_sell_fraction") or 0.5), None)
+    # scala spenta: modalità precedente, una sola presa parziale
+    return (float(cfg.get("partial_tp_trigger_pct") or 100), float(cfg.get("partial_tp_fraction") or 0.5), 1)
+
+
+def ladder_step_reached(pos: Position, price: float, cfg: dict[str, Any]) -> int:
+    """Gradino raggiunto dal prezzo: +100% = 1 (2x), +200% = 2 (3x), ... rispetto al prezzo medio d'ingresso."""
+    lad = ladder_cfg(cfg)
+    entry = pos.avg_entry_price_sol or 0
+    if lad is None or entry <= 0 or not price:
+        return 0
+    step_pct, _, max_steps = lad
+    chg = (price / entry - 1) * 100
+    k = int(chg // step_pct) if chg > 0 and step_pct > 0 else 0
+    return min(k, max_steps) if max_steps is not None else k
+
+
+def runner_trailing_pct(cfg: dict[str, Any], peak_x: float) -> float:
+    """Trailing del resto: più stretto quando il massimo raggiunto è alto (30% sotto 3x, 20% da 3x, 15% da 5x)."""
+    trail = float(cfg.get("runner_trailing_stop_pct") or 0)
+    for n in ("1", "2"):
+        tx = float(cfg.get(f"runner_trailing_tier{n}_x") or 0)
+        tp = cfg.get(f"runner_trailing_tier{n}_pct")
+        if tx > 0 and tp is not None and peak_x >= tx:
+            trail = float(tp)
+    return trail
+
+
+def exit_plan(s: Session, position_id: int, reason: str) -> tuple[float, Optional[int]]:
+    """(quota da vendere, gradino) per un'uscita.
+
+    Presa a gradini: per ogni gradino nuovo si vende tp_ladder_sell_fraction del RIMANENTE. Se tra due controlli il
+    prezzo salta più gradini (es. da 2x a 4x) si fa UNA sola vendita pari a quanto la scala avrebbe venduto in sequenza:
+    1 - (1 - 0.5)^gradini_saltati (2 gradini -> 75% del rimanente). Mai di più: niente vendite eccessive.
+    Al primo gradino si vende comunque abbastanza da recuperare tutto il capitale (+5% per costi).
+    Se il resto varrebbe meno di min_remaining_value_sol, si vende tutto.
+    """
     if reason != "partial_take_profit":
-        return 1.0
+        return 1.0, None
     cfg = get_settings_section(s, "engine")
     pos = s.get(Position, position_id)
-    base = float(cfg.get("partial_tp_fraction") or 0.5)
-    if pos is None or not pos.qty:
-        return base
+    lad = ladder_cfg(cfg)
+    if pos is None or not pos.qty or lad is None:
+        return 0.5, None
     price, _, _ = token_price(s, pos.mint)
-    value = pos.qty * (price or pos.last_price_sol or 0)
-    if value <= 0:
-        return base
-    # frazione che riporta a casa tutto il costo (con margine 5% per slippage e commissioni)
-    principal = pos.cost_sol * 1.05 / value
-    return max(base, min(1.0, principal))
+    price = price or pos.last_price_sol or 0
+    done = steps_done(pos)
+    k = ladder_step_reached(pos, price, cfg)
+    n = max(1, k - done)
+    f = min(max(lad[1], 0.0), 1.0)
+    fraction = 1 - (1 - f) ** n
+    value = pos.qty * price
+    if done == 0 and value > 0:
+        fraction = max(fraction, min(1.0, pos.cost_sol * 1.05 / value))
+    dust = float(cfg.get("min_remaining_value_sol") or 0)
+    if dust > 0 and value * (1 - fraction) < dust:
+        fraction = 1.0
+    return min(fraction, 1.0), max(k, done + 1)
+
+
+def exit_fraction(s: Session, position_id: int, reason: str) -> float:
+    """Quota da vendere (vedi exit_plan)."""
+    return exit_plan(s, position_id, reason)[0]
 
 
 def failed_sells_since_last_fill(s: Session, pos: Position) -> int:
@@ -610,6 +689,7 @@ def write_off_position(s: Session, position_id: int, why: str) -> FillResult:
     from .learning import on_unsellable
 
     on_unsellable(s, pos, tok, why, get_settings_section(s, "engine"), get_settings_section(s, "copy"))
+    _learn_from_close(s, pos, tok)
     return FillResult(True, o.id, pos.id, "Posizione invendibile chiusa a valore 0", 0.0, 0.0)
 
 
@@ -644,7 +724,7 @@ def pick_rotation_victim(s: Session, *, origin: Optional[str] = None, exclude: O
     for p in s.scalars(stmt).all():
         if exclude and p.id in exclude:
             continue
-        if p.partial_tp_done or _held_minutes(p, now) < min_hold:
+        if steps_done(p) > 0 or _held_minutes(p, now) < min_hold:
             continue
         price, _, tok = token_price(s, p.mint)
         if not price or not p.avg_entry_price_sol:

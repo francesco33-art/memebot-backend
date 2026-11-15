@@ -109,6 +109,7 @@ async def test_sniper_opens_simulated_position_for_passing_token(paper):
     with session_scope() as s:
         t = make_token(s, mint="SnipeMint111111111111111111111111111111pump", **good)
         t.holders, t.top10_pct, t.top1_pct, t.mint_authority, t.freeze_authority, t.rugged = 1500, 20, 5, False, False, False
+        t.dex_id, t.lp_locked_pct, t.lp_locked_main_pct = "pumpswap", 100.0, 100.0  # profilo sniper v2: LP bloccata
         from app.services.scanner import rescore
         rescore(t)
         assert t.score >= 55, (t.score, t.score_reasons)

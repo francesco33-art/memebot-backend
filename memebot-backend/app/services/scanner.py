@@ -24,7 +24,7 @@ from ..config import Settings, get_settings
 from ..db import session_scope
 from ..http import SourceHttp
 from ..models import Position, PriceSnapshot, Token, utcnow
-from ..sources.common import QUOTE_MINTS
+from ..sources.common import QUOTE_MINTS, normalize_dex
 from ..sources.dexscreener import Dexscreener
 from ..sources.fomo import FomoOnchain
 from ..sources.geckoterminal import GeckoTerminal
@@ -68,6 +68,8 @@ def upsert_token(s: Session, mint: str, data: dict[str, Any], source: str, *, sn
             continue
         if k == "created_at" and t.created_at is not None:
             continue  # la data di creazione più vecchia vince
+        if k == "dex_id":
+            v = normalize_dex(v)
         setattr(t, k, v)
     sol_usd = get_sol_usd(s)
     if data.get("price_usd") and not data.get("price_sol") and sol_usd:
@@ -131,7 +133,8 @@ class Scanner:
 
     def _host_stats(self, name: str) -> dict:
         host = {"dexscreener": "api.dexscreener.com", "geckoterminal": "api.geckoterminal.com", "jupiter": "lite-api.jup.ag",
-                "rugcheck": "api.rugcheck.xyz", "fomo": "api.mainnet-beta.solana.com", "enrich": "api.dexscreener.com"}.get(name)
+                "rugcheck": "api.rugcheck.xyz", "fomo": "api.mainnet-beta.solana.com", "enrich": "api.dexscreener.com",
+                "open_prices": "api.dexscreener.com"}.get(name)
         st = dict(self.http.stats.get(host, {})) if host else {}
         return st
 
@@ -141,7 +144,7 @@ class Scanner:
             with session_scope() as s:
                 t = s.get(Token, msg.get("mint"))
                 if t:
-                    t.dex_id = msg.get("pool") or "pumpswap"
+                    t.dex_id = normalize_dex(msg.get("pool")) or "pumpswap"
             return
         with session_scope() as s:
             sol_usd = get_sol_usd(s)
@@ -216,6 +219,21 @@ class Scanner:
                 .order_by(Token.enriched_at.asc()).limit(40)
             ).all()
         return list(dict.fromkeys([*open_mints, *never, *active]))[:120]
+
+    async def open_prices(self) -> None:
+        """Aggiornamento rapido dei soli token con posizioni aperte: la scala di profitto e i trailing reagiscono
+        prima ai crolli improvvisi. Nessuno snapshot salvato qui (lo fa già enrich) per non gonfiare il database."""
+        with session_scope() as s:
+            mints = list(dict.fromkeys(s.scalars(select(Position.mint).where(Position.status == "open")).all()))[:30]
+        if not mints:
+            return
+        pairs = await self.dex.tokens(mints)
+        best = self.dex.best_pairs(pairs)
+        with session_scope() as s:
+            for mint in mints:
+                p = best.get(mint)
+                if p and s.get(Token, mint) is not None:
+                    upsert_token(s, mint, self.dex.normalize_pair(p), "dexscreener", snapshot=False)
 
     async def enrich(self) -> None:
         mints = self._enrich_candidates()
@@ -324,7 +342,8 @@ class Scanner:
             t = s.get(Token, mint)
             if t is None:
                 return
-            for k in ("holders", "top10_pct", "top1_pct", "mint_authority", "freeze_authority", "rugged", "rug_risks"):
+            for k in ("holders", "top10_pct", "top1_pct", "mint_authority", "freeze_authority", "rugged", "rug_risks",
+                      "lp_locked_pct", "lp_locked_main_pct"):
                 setattr(t, k, rep.get(k))
             if rep.get("creator") and not t.creator:
                 t.creator = rep["creator"]
@@ -391,6 +410,8 @@ class Scanner:
             jobs.append(self.pump_task())
         if c.enable_dexscreener:
             jobs.append(self._loop("dexscreener", c.dexscreener_discovery_interval, self.dexscreener_discovery))
+            if c.open_price_interval and c.open_price_interval > 0:
+                jobs.append(self._loop("open_prices", c.open_price_interval, self.open_prices))
         if c.enable_geckoterminal:
             jobs.append(self._loop("geckoterminal", c.geckoterminal_interval, self.geckoterminal))
         if c.enable_rugcheck:

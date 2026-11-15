@@ -1,7 +1,7 @@
 """Impostazioni persistite su DB (sniper, motore). Valori di default sensati per la demo."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -44,7 +44,16 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "partial_tp_trigger_pct": 100,  # +100% = 2x
         "partial_tp_fraction": 0.5,  # vende almeno il 50% (di più se serve a recuperare tutto il capitale)
         "partial_tp_replaces_full_tp": True,  # il take profit fisso viene sostituito dalla logica runner
-        "runner_trailing_stop_pct": 30,  # resto: esce se il prezzo scende del 30% dal massimo
+        # scala di prese di profitto: a ogni +100% (2x, 3x, 4x...) vende il 50% di quello che resta
+        "tp_ladder_enabled": True,
+        "tp_ladder_step_pct": 100,
+        "tp_ladder_sell_fraction": 0.5,
+        "min_remaining_value_sol": 0.01,  # se dopo una vendita parziale resterebbe meno di 0.01 SOL, vende tutto
+        "runner_trailing_stop_pct": 30,  # resto: esce se il prezzo scende del 30% dal massimo (massimo sotto 3x)
+        "runner_trailing_tier1_x": 3,  # massimo >= 3x -> trailing più stretto
+        "runner_trailing_tier1_pct": 20,
+        "runner_trailing_tier2_x": 5,  # massimo >= 5x -> ancora più stretto
+        "runner_trailing_tier2_pct": 15,
         "runner_mcap_drop_pct": 35,  # ...o se la market cap scende del 35% dal massimo
         "runner_volume_drop_ratio": 0.25,  # ...o se il volume 5m < 25% della media 5m dell'ultima ora
         "runner_volume_exit_min_drawdown_pct": 10,  # (uscita per volume solo se già sotto il massimo del 10%)
@@ -60,18 +69,45 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "entry_pool_check_enabled": True,  # verifica on-chain (Dexscreener) dei SOL presenti nel pool
         "entry_min_pool_sol": 5,
         "blacklist_enabled": True,
-        "dex_blacklist_after_writeoffs": 3,  # dex con 3+ pool svuotati -> evitato
+        "dex_blacklist_after_writeoffs": 3,  # dex con 3+ pool svuotati...
+        "dex_blacklist_min_rate": 0.4,  # ...che sono almeno il 40% delle operazioni su quel dex -> evitato
     },
     "sniper": {
         "enabled": True,
-        "min_liquidity_usd": 8000,
-        "max_token_age_minutes": 60,
-        "min_score": 55,
+        # profilo "sniper selettivo" (v2, 15/11): soglie ricavate dall'analisi di 95 snipe chiusi (vedi docs)
+        "profile_version": 2,
+        "min_liquidity_usd": 20000,  # sotto 20k$ i pool PumpSwap erano in perdita netta
+        "min_token_age_minutes": 1,  # niente acquisti nel primissimo minuto (dati ancora incompleti)
+        "max_token_age_minutes": 20,  # oltre 20 min dal lancio il momentum è già esaurito
+        "min_score": 65,
         "min_buys_m5": 10,
         "max_top10_pct": 45,
+        "max_top1_pct": 15,  # un singolo wallet con più del 15% può svuotare il prezzo
         "allowed_risk": ["LOW", "MEDIUM"],
-        "amount_sol": 0.1,
-        "max_open_positions": 5,
+        "allowed_dexes": ["pumpswap"],  # unico venue in attivo; [] = tutti (salvo lista nera)
+        # LP: chi ha creato il pool non deve poter ritirare la liquidità (dato RugCheck, gratuito)
+        "require_lp_locked": True,
+        "min_lp_locked_pct": 90,
+        "lp_lock_scope": "all",  # "all" = tutti i pool del token, "main" = solo il pool principale
+        "require_no_mint_authority": True,
+        "require_no_freeze_authority": True,
+        "min_pool_sol": 40,  # SOL reali nel pool (verifica Dexscreener) per lo sniper
+        "max_mcap_liquidity_ratio": 0,  # 0 = spento (es. 3 = market cap al massimo 3x la liquidità)
+        # ritmo: meno operazioni = meno commissioni e meno raffiche di ingressi sbagliati
+        "max_trades_per_hour": 6,
+        "min_seconds_between_trades": 120,
+        "pause_after_consecutive_losses": 4,
+        "pause_minutes": 30,
+        # apprendimento: dopo i rug alza da solo le soglie, dopo una serie di vincite le riallenta
+        "learning_enabled": True,
+        "rug_loss_pct": 80,  # perdita >= 80% (o pool svuotato) = rug
+        "learn_score_step": 5,
+        "learn_liquidity_step_usd": 5000,
+        "learn_max_score_boost": 15,
+        "learn_max_liquidity_boost_usd": 30000,
+        "learn_relax_after_wins": 3,
+        "amount_sol": 0.05,  # metà della dimensione precedente
+        "max_open_positions": 3,
         "stop_loss_pct": 25,
         "take_profit_pct": 60,
         "trailing_stop_pct": 20,
@@ -110,3 +146,22 @@ def update_settings_section(s: Session, key: str, values: dict[str, Any]) -> dic
         row.value = cur
     s.flush()
     return get_settings_section(s, key)
+
+
+# ------------------------------------------------------------------ profili (aggiornano UNA volta i valori salvati)
+# I valori salvati sul database hanno la precedenza sui default: senza questo passaggio le nuove soglie
+# non verrebbero mai applicate al bot già in esecuzione. Non tocca "enabled" (acceso/spento resta com'è).
+SNIPER_PROFILE_VERSION = 2
+SNIPER_PROFILE_V2_KEYS = ("min_liquidity_usd", "max_token_age_minutes", "min_score", "amount_sol", "max_open_positions")
+
+
+def apply_settings_profiles(s: Session) -> Optional[dict[str, Any]]:
+    row = s.get(SettingKV, "sniper")
+    cur = dict(row.value) if row and isinstance(row.value, dict) else {}
+    if int(cur.get("profile_version") or 1) >= SNIPER_PROFILE_VERSION:
+        return None
+    before = {k: cur.get(k) for k in SNIPER_PROFILE_V2_KEYS if k in cur}
+    vals = {k: DEFAULTS["sniper"][k] for k in SNIPER_PROFILE_V2_KEYS}
+    vals["profile_version"] = SNIPER_PROFILE_VERSION
+    update_settings_section(s, "sniper", vals)
+    return {"before": before, "after": vals}

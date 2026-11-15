@@ -51,3 +51,26 @@ def parse_iso(v: Any) -> Optional[datetime]:
         return datetime.fromisoformat(f"{m.group(1)}.{frac}{m.group(3)}")
     except ValueError:
         return None
+
+
+# Nomi dei dex diversi tra le fonti (GeckoTerminal "meteora-damm-v2", Dexscreener "meteora", PumpPortal "pump-amm"...):
+# senza normalizzazione la lista nera "meteora" non bloccava i pool Meteora scoperti da GeckoTerminal.
+_DEX_ALIASES = {
+    "pump-fun": "pumpfun", "pump_fun": "pumpfun", "pump.fun": "pumpfun", "pumpfun": "pumpfun",
+    "pumpswap": "pumpswap", "pump-swap": "pumpswap", "pump-amm": "pumpswap", "pump_amm": "pumpswap",
+    "pump_fun_amm": "pumpswap", "pump-fun-amm": "pumpswap",
+    "meteora-dbc": "meteoradbc", "meteora_dbc": "meteoradbc", "meteoradbc": "meteoradbc",
+}
+
+
+def normalize_dex(v: Any) -> Optional[str]:
+    """Nome canonico del dex (stile Dexscreener): pumpswap, pumpfun, meteora, meteoradbc, raydium, orca..."""
+    if not v:
+        return None
+    k = str(v).strip().lower()
+    if k in _DEX_ALIASES:
+        return _DEX_ALIASES[k]
+    for fam in ("meteora", "raydium", "orca"):  # meteora damm v1/v2/dlmm, raydium cpmm/clmm/launchlab...
+        if k.startswith(fam):
+            return fam
+    return k.replace("-", "").replace("_", "") or None

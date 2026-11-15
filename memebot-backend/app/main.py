@@ -6,9 +6,11 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from .config import get_settings
 from .db import init_engine
@@ -38,6 +40,15 @@ async def lifespan(app: FastAPI):  # noqa: ANN201
             logger.info("correzione saldo all'avvio: %s", res)
     except Exception:  # noqa: BLE001
         logger.exception("correzione saldo all'avvio fallita")
+    try:
+        from .services.maintenance import run_startup_learning_fixes
+
+        with session_scope() as db:
+            fixes = run_startup_learning_fixes(db)
+        if fixes:
+            logger.info("aggiornamento sniper/lista nera all'avvio: %s", fixes)
+    except Exception:  # noqa: BLE001
+        logger.exception("aggiornamento sniper all'avvio fallito")
     tasks = []
     if s.run_workers:
         from .worker import service_coros
@@ -65,7 +76,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 async def demo_guard_and_auth(request: Request, call_next):  # noqa: ANN001, ANN201
     token = get_settings().api_token
     path = request.url.path
-    if token and path != "/" and not path.startswith(OPEN_PREFIXES):
+    is_web = path == "/app" or path.startswith("/app/")  # pagina web statica: i dati restano protetti dal token
+    if token and path != "/" and not is_web and not path.startswith(OPEN_PREFIXES):
         if request.headers.get("x-api-key") != token and request.query_params.get("token") != token:
             return JSONResponse({"detail": "API token mancante o errato"}, status_code=401)
     if request.method in ("POST", "PUT", "PATCH"):
@@ -93,6 +105,27 @@ app.include_router(api_router)
 app.include_router(ws_router)
 
 
+# ------------------------------------------------------------------ pagina web per iPhone (PWA), file statici
+WEB_DIR = Path(__file__).resolve().parent / "web"
+WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8",
+             ".json": "application/manifest+json", ".png": "image/png"}
+
+
+@app.get("/app", include_in_schema=False)
+def web_root() -> RedirectResponse:
+    return RedirectResponse("/app/", status_code=307)
+
+
+@app.get("/app/", include_in_schema=False)
+@app.get("/app/{name}", include_in_schema=False)
+def web_file(name: str = "index.html") -> FileResponse:
+    f = (WEB_DIR / name).resolve()
+    if f.parent != WEB_DIR or f.suffix not in WEB_TYPES or not f.is_file():
+        raise HTTPException(404, "Non trovato")
+    cache = "public, max-age=86400" if f.suffix == ".png" else "no-cache"
+    return FileResponse(f, media_type=WEB_TYPES[f.suffix], headers={"Cache-Control": cache})
+
+
 @app.get("/", include_in_schema=False)
 def root() -> dict:
-    return {"name": "MEMEBOT", "mode": "DEMO ONLY", "docs": "/docs", "health": "/api/health"}
+    return {"name": "MEMEBOT", "mode": "DEMO ONLY", "docs": "/docs", "health": "/api/health", "app": "/app/"}

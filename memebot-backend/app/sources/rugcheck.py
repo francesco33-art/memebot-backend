@@ -1,7 +1,7 @@
 """RugCheck API pubblica (https://api.rugcheck.xyz/swagger). Report token: holder, authority, rischi."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from ..http import SourceHttp
 from .common import fnum
@@ -40,7 +40,10 @@ class RugCheck:
             {"name": r.get("name"), "level": r.get("level"), "description": r.get("description")}
             for r in (d.get("risks") or [])
         ]
+        lp_all, lp_main = lp_lock_stats(d.get("markets") or [])
         return {
+            "lp_locked_pct": lp_all,
+            "lp_locked_main_pct": lp_main,
             "holders": d.get("totalHolders"),
             "top10_pct": round(sum(pcts[:10]), 2) if pcts else None,
             "top1_pct": round(pcts[0], 2) if pcts else None,
@@ -51,3 +54,25 @@ class RugCheck:
             "insiders": d.get("graphInsidersDetected"),
             "creator": d.get("creator"),
         }
+
+
+def lp_lock_stats(markets: list[dict[str, Any]]) -> tuple[Optional[float], Optional[float]]:
+    """(% LP bloccata/bruciata nel pool PEGGIORE, % nel pool con più liquidità).
+
+    LP non bloccata = chi ha creato il pool può ritirare la liquidità in qualsiasi momento (rug pull).
+    Dati MEMEBOT 14-15/11: 30 snipe su pool Meteora con LP bloccata 0% -> 27 svuotati (-2.2 SOL);
+    i pool PumpSwap (LP bruciata 100%) erano in attivo.
+    """
+    rows = []
+    for m in markets or []:
+        lp = m.get("lp") or {}
+        pct = fnum(lp.get("lpLockedPct"))
+        if pct is None:
+            continue
+        liq = (fnum(lp.get("quoteUSD")) or 0.0) + (fnum(lp.get("baseUSD")) or 0.0)
+        rows.append((pct, liq))
+    if not rows:
+        return None, None
+    worst = min(p for p, _ in rows)
+    main = max(rows, key=lambda r: r[1])[0]
+    return round(worst, 2), round(main, 2)

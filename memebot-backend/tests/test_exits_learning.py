@@ -37,6 +37,7 @@ def _set_tok(mint=MINT, **kw):
 async def test_partial_take_profit_at_2x_then_runner_trailing(paper):
     with session_scope() as s:
         make_token(s, market_cap_usd=100_000)
+        update_settings_section(s, "engine", {"tp_ladder_enabled": False})  # modalità precedente: una sola presa parziale
     r = await paper.buy(MINT, 0.5, origin="copy", copy_wallet=WALLET, stop_loss_pct=35, take_profit_pct=100)
     _age(r.position_id, 5)  # niente guardia "guadagno impossibile in pochi secondi"
     set_price(MINT, 0.0000021)  # +110%
@@ -115,6 +116,7 @@ async def test_rotation_frees_capital_for_strong_sniper_signal(paper):
     with session_scope() as s:
         t = make_token(s, mint="SnipeMint111111111111111111111111111111pump", **good)
         t.holders, t.top10_pct, t.top1_pct, t.mint_authority, t.freeze_authority, t.rugged = 1500, 20, 5, False, False, False
+        t.dex_id, t.lp_locked_pct, t.lp_locked_main_pct = "pumpswap", 100.0, 100.0  # profilo sniper v2: LP bloccata
         from app.services.scanner import rescore
         rescore(t)
         assert t.score >= 60
